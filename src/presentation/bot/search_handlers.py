@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from uuid import UUID
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 from punq import Container
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,10 +18,12 @@ from src.domain.user.user import User
 from src.domain.user.value_objects import SearchFilter
 from src.infra.database.directions_seed import ensure_directions_seed
 from src.presentation.bot import keyboards as kb
-from src.presentation.bot.avatar_utils import format_age_caption, resolve_photo_for_card
 from src.presentation.bot.states import Search
 
 router = Router(name="search")
+
+_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets")
+_DEFAULT_AVATAR = os.path.normpath(os.path.join(_ASSETS_DIR, "default_avatar.png"))
 
 _STATUS_LABELS = {
     UserStatus.SCHOOL: "Школьник",
@@ -37,9 +40,10 @@ _MODE_LABELS = {
 
 def _build_card_caption(user: User, direction_name: str | None) -> str:
     lines: list[str] = []
-    fn = user.first_name or "—"
-    ln = user.last_name or "—"
-    lines.append(f"{fn} {ln}, {format_age_caption(user)}")
+    name_line = f"{user.first_name} {user.last_name}, {user.age} лет"
+    if user.telegram_username:
+        name_line += f"  @{user.telegram_username}"
+    lines.append(name_line)
     dir_label = direction_name or user.custom_direction_label or "—"
     lines.append(f"Направление: {dir_label}")
     if user.user_status:
@@ -63,6 +67,12 @@ def _build_card_caption(user: User, direction_name: str | None) -> str:
     if user.team_seeking_mode:
         lines.append(_MODE_LABELS.get(user.team_seeking_mode, ""))
     return "\n".join(lines)
+
+
+async def _get_avatar(user: User, bot, container: Container) -> FSInputFile | str:
+    if user.telegram_avatar_file_id:
+        return user.telegram_avatar_file_id
+    return FSInputFile(_DEFAULT_AVATAR)
 
 
 async def _show_result(
@@ -114,7 +124,7 @@ async def _show_result(
             direction_name = d.name
 
     caption = _build_card_caption(found_user, direction_name)
-    photo = await resolve_photo_for_card(bot, container, found_user)
+    photo = await _get_avatar(found_user, bot, container)
     pagination = kb.search_pagination_keyboard(offset, result.total)
 
     await target.answer_photo(photo=photo, caption=caption, reply_markup=pagination)
