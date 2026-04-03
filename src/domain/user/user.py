@@ -34,6 +34,7 @@ class User:
         team_seeking_mode: TeamSeekingMode | None = None,
         age: int | None = None,
         telegram_avatar_file_id: str | None = None,
+        avatar_url: str | None = None,
     ) -> None:
         self.id = id
         self.onboarding_completed_at = onboarding_completed_at
@@ -54,6 +55,7 @@ class User:
         self.team_seeking_mode = team_seeking_mode
         self.age = age
         self.telegram_avatar_file_id = telegram_avatar_file_id
+        self.avatar_url = avatar_url
 
     @classmethod
     def create_new(cls) -> User:
@@ -191,6 +193,22 @@ class User:
         self.onboarding_completed_at = datetime.now(tz=UTC)
         self.onboarding_draft = {}
 
+    def _clear_education_fields_for_status(self, status: UserStatus) -> None:
+        """Сбрасывает поля, не относящиеся к выбранному статусу (смена школа↔вуз)."""
+        if status == UserStatus.SCHOOL:
+            self.student_course = None
+            self.university = None
+            self.specialty = None
+        elif status in (UserStatus.STUDENT, UserStatus.MASTER):
+            self.school_grade = None
+            self.school_name = None
+        elif status == UserStatus.NOT_STUDYING:
+            self.school_grade = None
+            self.school_name = None
+            self.student_course = None
+            self.university = None
+            self.specialty = None
+
     def update_profile(self, updates: dict[str, Any]) -> None:
         if not self.is_onboarding_complete:
             raise DomainValidationError("Cannot update profile before onboarding is complete")
@@ -213,6 +231,7 @@ class User:
                 self.custom_direction_label = str(value).strip() if value else None
             elif key == dk.USER_STATUS:
                 self.user_status = UserStatus(str(value))
+                self._clear_education_fields_for_status(self.user_status)
             elif key == dk.TEAM_SEEKING_MODE:
                 self.team_seeking_mode = TeamSeekingMode(str(value))
             elif key == dk.SCHOOL_GRADE:
@@ -225,3 +244,7 @@ class User:
                 self.university = str(value).strip() if value else None
             elif key == dk.SPECIALTY:
                 self.specialty = str(value).strip() if value else None
+            elif key == dk.TELEGRAM_AVATAR_FILE_ID:
+                self.telegram_avatar_file_id = str(value) if value else None
+            elif key == dk.AVATAR_URL:
+                self.avatar_url = str(value).strip() if value else None

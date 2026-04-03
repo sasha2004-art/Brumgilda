@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-import os
 from uuid import UUID
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import (
-    BufferedInputFile,
-    CallbackQuery,
-    FSInputFile,
-    Message,
-)
+from aiogram.types import CallbackQuery, Message
 from punq import Container
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.application.usecases.user.get_user import GetUser
 from src.application.usecases.user.update_user_profile import UpdateUserProfile
@@ -21,13 +16,16 @@ from src.domain.user import draft_keys as dk
 from src.domain.user.enums import TeamSeekingMode, UserStatus
 from src.domain.user.exceptions import DomainValidationError
 from src.domain.user.user import User
+from src.infra.database.directions_seed import ensure_directions_seed
 from src.presentation.bot import keyboards as kb
+from src.presentation.bot.avatar_utils import (
+    format_age_caption,
+    persist_telegram_avatar_file_id,
+    resolve_photo_for_card,
+)
 from src.presentation.bot.states import ProfileEdit
 
 router = Router(name="profile")
-
-_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets")
-_DEFAULT_AVATAR = os.path.normpath(os.path.join(_ASSETS_DIR, "default_avatar.png"))
 
 _STATUS_LABELS = {
     UserStatus.SCHOOL: "Школьник",
@@ -42,9 +40,22 @@ _MODE_LABELS = {
 }
 
 
+async def _update_profile_or_fail(
+    message: Message, container: Container, user_id: UUID, updates: dict
+) -> bool:
+    try:
+        await container.resolve(UpdateUserProfile).execute(user_id, updates)
+    except DomainValidationError as e:
+        await message.answer(f"Ошибка: {e}")
+        return False
+    return True
+
+
 def _build_profile_caption(user: User, direction_name: str | None) -> str:
     lines: list[str] = []
-    lines.append(f"{user.first_name} {user.last_name}, {user.age} лет")
+    fn = user.first_name or "—"
+    ln = user.last_name or "—"
+    lines.append(f"{fn} {ln}, {format_age_caption(user)}")
     dir_label = direction_name or user.custom_direction_label or "—"
     lines.append(f"Направление: {dir_label}")
     if user.user_status:
@@ -70,27 +81,21 @@ def _build_profile_caption(user: User, direction_name: str | None) -> str:
     return "\n".join(lines)
 
 
-async def _get_avatar_photo(
-    user: User, bot, telegram_user_id: int
-) -> FSInputFile | str:
-    try:
-        photos = await bot.get_user_profile_photos(telegram_user_id, limit=1)
-        if photos.total_count > 0:
-            file_id = photos.photos[0][-1].file_id
-            return file_id
-    except Exception:
-        pass
-    return FSInputFile(_DEFAULT_AVATAR)
-
-
 async def _send_profile_card(
     target: Message,
     user: User,
     container: Container,
     bot,
-    telegram_user_id: int,
+    *,
+    telegram_actor_id: int | None = None,
     reply_markup=None,
 ) -> None:
+    if telegram_actor_id is not None:
+        await persist_telegram_avatar_file_id(bot, container, user.id, telegram_actor_id)
+        refreshed = await container.resolve(GetUser).execute(user.id)
+        if refreshed is not None:
+            user = refreshed
+
     dirs = container.resolve(IDirectionRepository)
     direction_name = None
     if user.direction_id:
@@ -98,7 +103,7 @@ async def _send_profile_card(
         if d:
             direction_name = d.name
     caption = _build_profile_caption(user, direction_name)
-    photo = await _get_avatar_photo(user, bot, telegram_user_id)
+    photo = await resolve_photo_for_card(bot, container, user)
     await target.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
 
 
@@ -114,8 +119,11 @@ async def cmd_profile(
         await message.answer("Сначала завершите регистрацию: /start")
         return
     await _send_profile_card(
-        message, user, container, message.bot,
-        message.from_user.id,
+        message,
+        user,
+        container,
+        message.bot,
+        telegram_actor_id=message.from_user.id,
         reply_markup=kb.profile_edit_keyboard(),
     )
 
@@ -146,9 +154,6 @@ async def pedit_direction(
     cq: CallbackQuery, state: FSMContext, container: Container, **_: object
 ) -> None:
     await cq.answer()
-    from sqlalchemy.ext.asyncio import AsyncSession
-    from src.infra.database.directions_seed import ensure_directions_seed
-
     session = container.resolve(AsyncSession)
     await ensure_directions_seed(session)
     await session.flush()
@@ -181,19 +186,21 @@ async def _apply_update_and_show_profile(
     user_id: UUID,
     state: FSMContext,
     updates: dict,
+    *,
+    telegram_actor_id: int,
 ) -> None:
-    try:
-        await container.resolve(UpdateUserProfile).execute(user_id, updates)
-    except DomainValidationError as e:
-        await message.answer(f"Ошибка: {e}")
+    if not await _update_profile_or_fail(message, container, user_id, updates):
         return
     await state.clear()
     user = await container.resolve(GetUser).execute(user_id)
-    if user is None or message.from_user is None:
+    if user is None:
         return
     await _send_profile_card(
-        message, user, container, message.bot,
-        message.from_user.id,
+        message,
+        user,
+        container,
+        message.bot,
+        telegram_actor_id=telegram_actor_id,
         reply_markup=kb.profile_edit_keyboard(),
     )
 
@@ -202,10 +209,15 @@ async def _apply_update_and_show_profile(
 async def on_pedit_first_name(
     message: Message, state: FSMContext, container: Container, user_id: UUID | None
 ) -> None:
-    if user_id is None:
+    if user_id is None or message.from_user is None:
         return
     await _apply_update_and_show_profile(
-        message, container, user_id, state, {dk.FIRST_NAME: message.text.strip()}
+        message,
+        container,
+        user_id,
+        state,
+        {dk.FIRST_NAME: message.text.strip()},
+        telegram_actor_id=message.from_user.id,
     )
 
 
@@ -213,10 +225,15 @@ async def on_pedit_first_name(
 async def on_pedit_last_name(
     message: Message, state: FSMContext, container: Container, user_id: UUID | None
 ) -> None:
-    if user_id is None:
+    if user_id is None or message.from_user is None:
         return
     await _apply_update_and_show_profile(
-        message, container, user_id, state, {dk.LAST_NAME: message.text.strip()}
+        message,
+        container,
+        user_id,
+        state,
+        {dk.LAST_NAME: message.text.strip()},
+        telegram_actor_id=message.from_user.id,
     )
 
 
@@ -224,14 +241,19 @@ async def on_pedit_last_name(
 async def on_pedit_age(
     message: Message, state: FSMContext, container: Container, user_id: UUID | None
 ) -> None:
-    if user_id is None:
+    if user_id is None or message.from_user is None:
         return
     text = (message.text or "").strip()
     if not text.isdigit() or not (10 <= int(text) <= 100):
         await message.answer("Введите число от 10 до 100.")
         return
     await _apply_update_and_show_profile(
-        message, container, user_id, state, {dk.AGE: int(text)}
+        message,
+        container,
+        user_id,
+        state,
+        {dk.AGE: int(text)},
+        telegram_actor_id=message.from_user.id,
     )
 
 
@@ -260,7 +282,7 @@ async def on_pedit_dir_back(
 async def on_pedit_dir_pick(
     cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
 ) -> None:
-    if user_id is None or cq.message is None:
+    if user_id is None or cq.message is None or cq.from_user is None:
         return
     parsed = kb.parse_dir_callback(cq.data or "")
     if not isinstance(parsed, UUID):
@@ -283,8 +305,12 @@ async def on_pedit_dir_pick(
         await cq.message.answer("Опишите направление текстом:")
         return
     await _apply_update_and_show_profile(
-        cq.message, container, user_id, state,
+        cq.message,
+        container,
+        user_id,
+        state,
         {dk.DIRECTION_ID: str(node.id), dk.CUSTOM_DIRECTION_LABEL: None},
+        telegram_actor_id=cq.from_user.id,
     )
 
 
@@ -292,11 +318,15 @@ async def on_pedit_dir_pick(
 async def on_pedit_direction_custom(
     message: Message, state: FSMContext, container: Container, user_id: UUID | None
 ) -> None:
-    if user_id is None:
+    if user_id is None or message.from_user is None:
         return
     await _apply_update_and_show_profile(
-        message, container, user_id, state,
+        message,
+        container,
+        user_id,
+        state,
         {dk.CUSTOM_DIRECTION_LABEL: message.text.strip()},
+        telegram_actor_id=message.from_user.id,
     )
 
 
@@ -304,12 +334,142 @@ async def on_pedit_direction_custom(
 async def on_pedit_user_status(
     cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
 ) -> None:
-    if user_id is None or cq.message is None:
+    if user_id is None or cq.message is None or cq.from_user is None:
         return
     await cq.answer()
     raw = (cq.data or "")[3:]
+    try:
+        new_status = UserStatus(raw)
+    except ValueError:
+        return
+    if not await _update_profile_or_fail(
+        cq.message, container, user_id, {dk.USER_STATUS: raw}
+    ):
+        return
+
+    tid = cq.from_user.id
+    if new_status == UserStatus.SCHOOL:
+        await state.set_state(ProfileEdit.school_grade)
+        await cq.message.answer("Класс?", reply_markup=kb.school_grade_keyboard())
+        return
+    if new_status in (UserStatus.STUDENT, UserStatus.MASTER):
+        await state.set_state(ProfileEdit.student_course)
+        await cq.message.answer("Курс?", reply_markup=kb.student_course_keyboard())
+        return
+
+    await state.clear()
+    user = await container.resolve(GetUser).execute(user_id)
+    if user is None:
+        return
+    await _send_profile_card(
+        cq.message,
+        user,
+        container,
+        cq.bot,
+        telegram_actor_id=tid,
+        reply_markup=kb.profile_edit_keyboard(),
+    )
+
+
+@router.callback_query(ProfileEdit.school_grade, F.data.startswith("gr:"))
+async def on_pedit_school_grade(
+    cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or cq.message is None:
+        return
+    await cq.answer()
+    grade = int((cq.data or "").split(":")[1])
+    if not await _update_profile_or_fail(
+        cq.message, container, user_id, {dk.SCHOOL_GRADE: grade}
+    ):
+        return
+    await state.set_state(ProfileEdit.school_name)
+    await cq.message.answer(
+        "Школа (необязательно). Напишите название или «-», если не хотите указывать."
+    )
+
+
+@router.message(ProfileEdit.school_name, F.text)
+async def on_pedit_school_name(
+    message: Message, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or message.from_user is None:
+        return
+    text = message.text.strip()
+    val = "" if text == "-" else text
     await _apply_update_and_show_profile(
-        cq.message, container, user_id, state, {dk.USER_STATUS: raw}
+        message,
+        container,
+        user_id,
+        state,
+        {dk.SCHOOL_NAME: val},
+        telegram_actor_id=message.from_user.id,
+    )
+
+
+@router.callback_query(ProfileEdit.student_course, F.data.startswith("cr:"))
+async def on_pedit_student_course(
+    cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or cq.message is None:
+        return
+    await cq.answer()
+    course = int((cq.data or "").split(":")[1])
+    if not await _update_profile_or_fail(
+        cq.message, container, user_id, {dk.STUDENT_COURSE: course}
+    ):
+        return
+    await state.set_state(ProfileEdit.university)
+    await cq.message.answer(
+        "ВУЗ (необязательно). Можно пропустить кнопкой или написать «-».",
+        reply_markup=kb.university_skip_keyboard(),
+    )
+
+
+@router.callback_query(ProfileEdit.university, F.data == "uni:skip")
+async def on_pedit_university_skip(
+    cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or cq.message is None:
+        return
+    await cq.answer()
+    if not await _update_profile_or_fail(
+        cq.message, container, user_id, {dk.UNIVERSITY: ""}
+    ):
+        return
+    await state.set_state(ProfileEdit.specialty)
+    await cq.message.answer("Специальность (обязательно):")
+
+
+@router.message(ProfileEdit.university, F.text)
+async def on_pedit_university_text(
+    message: Message, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or message.from_user is None:
+        return
+    text = message.text.strip()
+    val = "" if text == "-" else text
+    if not await _update_profile_or_fail(
+        message, container, user_id, {dk.UNIVERSITY: val}
+    ):
+        return
+    await state.set_state(ProfileEdit.specialty)
+    await message.answer("Специальность (обязательно):")
+
+
+@router.message(ProfileEdit.specialty, F.text)
+async def on_pedit_specialty(
+    message: Message, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or message.from_user is None:
+        return
+    await _apply_update_and_show_profile(
+        message,
+        container,
+        user_id,
+        state,
+        {dk.SPECIALTY: message.text.strip()},
+        telegram_actor_id=message.from_user.id,
     )
 
 
@@ -317,10 +477,15 @@ async def on_pedit_user_status(
 async def on_pedit_team_mode(
     cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
 ) -> None:
-    if user_id is None or cq.message is None:
+    if user_id is None or cq.message is None or cq.from_user is None:
         return
     await cq.answer()
     mode = (cq.data or "").split(":")[1]
     await _apply_update_and_show_profile(
-        cq.message, container, user_id, state, {dk.TEAM_SEEKING_MODE: mode}
+        cq.message,
+        container,
+        user_id,
+        state,
+        {dk.TEAM_SEEKING_MODE: mode},
+        telegram_actor_id=cq.from_user.id,
     )
