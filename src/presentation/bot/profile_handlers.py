@@ -40,6 +40,17 @@ _MODE_LABELS = {
 }
 
 
+async def _update_profile_or_fail(
+    message: Message, container: Container, user_id: UUID, updates: dict
+) -> bool:
+    try:
+        await container.resolve(UpdateUserProfile).execute(user_id, updates)
+    except DomainValidationError as e:
+        await message.answer(f"Ошибка: {e}")
+        return False
+    return True
+
+
 def _build_profile_caption(user: User, direction_name: str | None) -> str:
     lines: list[str] = []
     fn = user.first_name or "—"
@@ -178,10 +189,7 @@ async def _apply_update_and_show_profile(
     *,
     telegram_actor_id: int,
 ) -> None:
-    try:
-        await container.resolve(UpdateUserProfile).execute(user_id, updates)
-    except DomainValidationError as e:
-        await message.answer(f"Ошибка: {e}")
+    if not await _update_profile_or_fail(message, container, user_id, updates):
         return
     await state.clear()
     user = await container.resolve(GetUser).execute(user_id)
@@ -330,13 +338,138 @@ async def on_pedit_user_status(
         return
     await cq.answer()
     raw = (cq.data or "")[3:]
-    await _apply_update_and_show_profile(
+    try:
+        new_status = UserStatus(raw)
+    except ValueError:
+        return
+    if not await _update_profile_or_fail(
+        cq.message, container, user_id, {dk.USER_STATUS: raw}
+    ):
+        return
+
+    tid = cq.from_user.id
+    if new_status == UserStatus.SCHOOL:
+        await state.set_state(ProfileEdit.school_grade)
+        await cq.message.answer("Класс?", reply_markup=kb.school_grade_keyboard())
+        return
+    if new_status in (UserStatus.STUDENT, UserStatus.MASTER):
+        await state.set_state(ProfileEdit.student_course)
+        await cq.message.answer("Курс?", reply_markup=kb.student_course_keyboard())
+        return
+
+    await state.clear()
+    user = await container.resolve(GetUser).execute(user_id)
+    if user is None:
+        return
+    await _send_profile_card(
         cq.message,
+        user,
+        container,
+        cq.bot,
+        telegram_actor_id=tid,
+        reply_markup=kb.profile_edit_keyboard(),
+    )
+
+
+@router.callback_query(ProfileEdit.school_grade, F.data.startswith("gr:"))
+async def on_pedit_school_grade(
+    cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or cq.message is None:
+        return
+    await cq.answer()
+    grade = int((cq.data or "").split(":")[1])
+    if not await _update_profile_or_fail(
+        cq.message, container, user_id, {dk.SCHOOL_GRADE: grade}
+    ):
+        return
+    await state.set_state(ProfileEdit.school_name)
+    await cq.message.answer(
+        "Школа (необязательно). Напишите название или «-», если не хотите указывать."
+    )
+
+
+@router.message(ProfileEdit.school_name, F.text)
+async def on_pedit_school_name(
+    message: Message, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or message.from_user is None:
+        return
+    text = message.text.strip()
+    val = "" if text == "-" else text
+    await _apply_update_and_show_profile(
+        message,
         container,
         user_id,
         state,
-        {dk.USER_STATUS: raw},
-        telegram_actor_id=cq.from_user.id,
+        {dk.SCHOOL_NAME: val},
+        telegram_actor_id=message.from_user.id,
+    )
+
+
+@router.callback_query(ProfileEdit.student_course, F.data.startswith("cr:"))
+async def on_pedit_student_course(
+    cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or cq.message is None:
+        return
+    await cq.answer()
+    course = int((cq.data or "").split(":")[1])
+    if not await _update_profile_or_fail(
+        cq.message, container, user_id, {dk.STUDENT_COURSE: course}
+    ):
+        return
+    await state.set_state(ProfileEdit.university)
+    await cq.message.answer(
+        "ВУЗ (необязательно). Можно пропустить кнопкой или написать «-».",
+        reply_markup=kb.university_skip_keyboard(),
+    )
+
+
+@router.callback_query(ProfileEdit.university, F.data == "uni:skip")
+async def on_pedit_university_skip(
+    cq: CallbackQuery, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or cq.message is None:
+        return
+    await cq.answer()
+    if not await _update_profile_or_fail(
+        cq.message, container, user_id, {dk.UNIVERSITY: ""}
+    ):
+        return
+    await state.set_state(ProfileEdit.specialty)
+    await cq.message.answer("Специальность (обязательно):")
+
+
+@router.message(ProfileEdit.university, F.text)
+async def on_pedit_university_text(
+    message: Message, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or message.from_user is None:
+        return
+    text = message.text.strip()
+    val = "" if text == "-" else text
+    if not await _update_profile_or_fail(
+        message, container, user_id, {dk.UNIVERSITY: val}
+    ):
+        return
+    await state.set_state(ProfileEdit.specialty)
+    await message.answer("Специальность (обязательно):")
+
+
+@router.message(ProfileEdit.specialty, F.text)
+async def on_pedit_specialty(
+    message: Message, state: FSMContext, container: Container, user_id: UUID | None
+) -> None:
+    if user_id is None or message.from_user is None:
+        return
+    await _apply_update_and_show_profile(
+        message,
+        container,
+        user_id,
+        state,
+        {dk.SPECIALTY: message.text.strip()},
+        telegram_actor_id=message.from_user.id,
     )
 
 
