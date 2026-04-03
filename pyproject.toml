@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "findteam"
 version = "0.1.0"
@@ -5,5 +9,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "asyncpg>=0.31.0",
+    "alembic>=1.18.4",
+    "aiogram>=3.26.0",
     "punq>=0.7.0",
+    "sqlalchemy[asyncio]>=2.0.48",
 ]
+
+[project.scripts]
+findteam-bot = "src.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

@@ -1,0 +1,20 @@
+from __future__ import annotations
+
+from typing import Protocol
+from uuid import UUID
+
+from src.domain.user.enums import IdentityProvider
+from src.domain.user.user import User
+
+
+class IUserRepository(Protocol):
+    async def get_by_id(self, user_id: UUID) -> User | None: ...
+    async def save(self, user: User) -> None: ...
+
+
+class IUserIdentityRepository(Protocol):
+    async def find_user_id_by_identity(
+        self, provider: IdentityProvider, subject_id: str
+    ) -> UUID | None: ...
+
+    async def link_identity(self, user_id: UUID, provider: IdentityProvider, subject_id: str) -> None: ...

@@ -7,10 +7,14 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     db_uri: str
+    telegram_bot_token: str
 
     @classmethod
     def get_config(cls) -> Config:
         try:
-            return cls(db_uri=os.environ["DB_URI"])
-        except KeyError:
-            raise ValueError("DB_URI environment variable not set")
+            return cls(
+                db_uri=os.environ["DB_URI"],
+                telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
+            )
+        except KeyError as e:
+            raise ValueError(f"Missing environment variable: {e.args[0]}") from e

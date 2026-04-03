@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: findteam-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-findteam}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-findteam}
+      POSTGRES_DB: ${POSTGRES_DB:-findteam}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - findteam_pg_data:/var/lib/postgresql/data
+
+volumes:
+  findteam_pg_data:
